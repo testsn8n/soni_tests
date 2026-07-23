@@ -1,0 +1,149 @@
+# Registro de hallazgos y soluciones — Agente Soni (Santana Smiles)
+
+> Documento vivo. Cada hallazgo tiene la misma estructura: **Problema** (qué pasa), **Por qué surgió** (la causa raíz), **Solución** (exactamente qué se cambió y dónde), **Estado**.
+
+---
+
+## CATEGORÍA 1 — Sub-workflows de horarios (Google Calendar)
+
+### 1.1 — `H disponible` sin manejo de cero resultados
+
+**Problema:** la herramienta `H disponible` (la más usada — paciente sin preferencia de día) consultaba un único día para armar la lista de horarios. Si ese día se llenaba, devolvía un array vacío y el agente se quedaba sin instrucción de qué hacer.
+
+**Por qué surgió:** a diferencia de `Fecha Busqueda` y `D disponible`, que sí tienen documentado en el prompt qué hacer ante "sin resultados", `H disponible` nunca contempló ese caso — ni en el código del sub-workflow ni en el prompt.
+
+**Solución exacta:**
+- **Sub-workflow `H disponible(2)`** (`j1PkjAFp8ZqPUeL2`) → nodo **`Code in JavaScript2`**: se cambió la lógica para generar horarios de los **próximos 2 días hábiles** en vez de solo 1 (mismo patrón de barrido multi-día que ya usaba `D Fecha(2)`). El punto de arranque (hoy+1) no se tocó. Publicado en n8n.
+- **Prompt del agente principal** (`Agente Soni(8)`, nodo `AI Agent` → `systemMessage`), sección **`5. HERRAMIENTAS → H disponible`**: se agregó la regla *"Sin resultados: si H disponible retorna vacío, llamar D disponible en el ciclo siguiente — mismo criterio que Fecha Busqueda sin resultados."*
+
+**Estado:** ✅ Aplicado y verificado.
+
+---
+
+### 1.2 — `D disponible` saltaba "mañana" por completo
+
+**Problema:** un paciente que pedía "esta semana" o "próxima semana" nunca veía el día siguiente al de hoy como opción, aunque tuviera horarios libres.
+
+**Por qué surgió:** el barrido de 6 días hábiles en `D Fecha(2)` arrancaba en `hoy + 2` en vez de `hoy + 1` — un remanente de código, no una política de negocio (se descartó que fuera una regla real de anticipación mínima: no aparece respaldada en ningún otro lugar del prompt ni del sistema).
+
+**Solución exacta:**
+- **Sub-workflow `D Fecha(2)`** (`pD0uuF9786Cg6w9r`) → nodo **`Code in JavaScript2`**: cambio de una sola línea — `cursor.setUTCDate(cursor.getUTCDate() + 2)` → `+ 1`. El resto del barrido (6 días, feriados, horarios Lu-Ju/Vi-Sá) quedó exactamente igual. Publicado en n8n.
+
+**Estado:** ✅ Aplicado y verificado.
+
+---
+
+## CATEGORÍA 2 — Integridad de datos (Google Sheets / Data Tables)
+
+### 2.1 — Reagendar no reiniciaba el aviso de recordatorio
+
+**Problema:** si un paciente ya había recibido su recordatorio de 6h/24h y luego reagendaba, el sistema no volvía a habilitarlo para el turno nuevo.
+
+**Por qué surgió:** en el sub-workflow `REAGENDAR(4)`, el nodo que actualiza el Google Sheet al reagendar actualizaba `Fecha Cita` y `Hora Cita`, pero nunca tocaba la columna `Aviso o recordatorio de cita enviado` — esa columna quedaba en `SI`, apuntando a la fecha vieja.
+
+**Solución exacta:**
+- **Sub-workflow `REAGENDAR(4)`** (`fwbyg9AsBi8fBUXs`) → nodo **`Update row in sheet`**: se agregó `"Aviso o recordatorio de cita enviado": "NO"` a las columnas que actualiza ese nodo, junto a Fecha Cita/Hora Cita.
+
+**Estado:** ✅ Aplicado y verificado.
+
+---
+
+### 2.2 — Caída total del servicio al corregir el nombre
+
+**Problema:** cuando un paciente corregía su nombre (ej. "perdón, mi apellido es Perez, no Peres"), el **siguiente mensaje de ese mismo paciente rompía la ejecución por completo** — no recibía ninguna respuesta.
+
+**Por qué surgió:** el nodo que guarda el nombre en la Data Table `Clientes` (dentro del workflow principal) hacía un **INSERT puro**, sin upsert. Cada vez que se emitía la variable `nombre` (la primera vez, y también en cada corrección — un flujo que el propio prompt fomenta explícitamente en CASO 15), el nodo agregaba una fila nueva en vez de actualizar la existente. Con la corrección, quedaban dos filas con el mismo `Numero_cel`. En el ciclo siguiente, el nodo que arma el contexto del paciente (`Get row(s)`) encontraba esas dos filas y no podía desambiguar cuál usar — n8n tira el error real `"Multiple matches found"` y la ejecución se cae ahí mismo, sin respuesta al paciente.
+
+**Solución exacta:**
+- **Workflow principal `Agente Soni(8)`** (`IZbSvQhjd5tgbEu1`) → nodo **`nombre`**: se cambió la operación de INSERT puro a **`upsert`**, agregando el filtro `{"conditions": [{"keyName": "Numero_cel", "keyValue": "={{ $('Code in JavaScript2').item.json.codigo }}"}]}` — mismo patrón exacto que ya usaban los nodos hermanos `Agendamiento`, `Motivo Consulta` y `BLOQUEO` sobre la misma tabla `Clientes`.
+
+**Estado:** ✅ Aplicado y **validado en vivo**: se reprodujo el escenario exacto (capturar nombre → corregirlo → enviar un tercer mensaje) y ya no se cae. Es el hallazgo más grave de toda la ronda de pruebas por tratarse de una caída total del servicio, no solo una respuesta incorrecta.
+
+---
+
+## CATEGORÍA 3 — Prompt: anti-alucinación
+
+### 3.1 — Alucinación de precio (confirmada con evidencia dura)
+
+**Problema:** ante una pregunta directa de precio ("¿cuánto cuesta el blanqueamiento?"), el agente respondió con un precio específico ($30.000) que no era real.
+
+**Por qué surgió:** se confirmó revisando directamente el nodo `AI Agent` de esa ejecución que `tool_calls.completed: 0` — el modelo nunca llamó a la herramienta `informacion Doc` en ese ciclo. El precio salió enteramente de la generación del modelo, pese a que R11 y CASO 12 del prompt ya decían "sin excepción, nunca de memoria".
+
+**Solución exacta (refuerzo de prompt, 4 puntos):**
+- **Workflow principal `Agente Soni(8)`** → nodo `AI Agent` → `systemMessage`:
+  1. Nueva **Regla Absoluta G** (sección "⛔ REGLAS ABSOLUTAS"): ningún precio se menciona sin haber llamado `informacion Doc` en ese mismo ciclo, ni siquiera si ya se mencionó antes en la conversación.
+  2. Nueva **regla irrompible** dentro de la sección `5. HERRAMIENTAS → informacion Doc`, con el mismo mensaje aplicado específicamente a esa herramienta.
+  3. Nuevo **ítem 31** del checklist de verificación (sección 9).
+  4. Nueva **regla R34** (sección 10).
+
+**Estado:** ✅ Aplicado y **validado en vivo**: se repitió el mismo escenario exacto y esta vez el modelo llamó a `informacion Doc` correctamente (confirmado con `tool_calls.completed: 1`) y dio el precio real, sin inventar nada.
+
+---
+
+### 3.2 — Mención de un servicio en pregunta de precio disparaba agendamiento (hallazgo relacionado, descubierto al validar 3.1)
+
+**Problema:** un mensaje como "solo quiero saber el precio del blanqueamiento por ahora" hacía que el modelo tratara el nombre del servicio como una selección directa (CASO DIRECTO) y saltara al flujo de agendamiento — ignorando la pregunta de precio y la aclaración explícita de "por ahora" (no quería agendar todavía).
+
+**Por qué surgió:** la lógica de CASO DIRECTO en la sección de MOTIVO del prompt no distinguía entre "el paciente nombra un servicio porque quiere agendarlo" y "el paciente nombra un servicio porque está preguntando su precio". Cualquier mención del nombre del servicio disparaba la selección directa, sin excepción.
+
+**Solución exacta (refuerzo de prompt, 4 puntos):**
+- **Workflow principal `Agente Soni(8)`** → nodo `AI Agent` → `systemMessage`:
+  1. Nueva **excepción obligatoria** dentro de la sección `4.2 MOTIVO`, antes de la lista de CASO DIRECTO: si el mensaje es en realidad una pregunta de precio/información sin pedir turno, tratarlo como CASO 12, nunca como `motivo`.
+  2. Nuevo **CASO 12C** (sección 11), con el ejemplo real exacto de esta falla.
+  3. Nuevo **ítem 32** del checklist de verificación.
+  4. Nueva **regla R35** (sección 10).
+
+**Estado:** ✅ Aplicado y **validado en vivo**: se repitió el mismo mensaje exacto ("solo quiero saber el precio... por ahora") y esta vez el modelo llamó a `informacion Doc`, dio el precio real, **no emitió `motivo`**, y hasta ajustó el tono de la pregunta final reconociendo que la paciente había dicho "por ahora".
+
+---
+
+## CATEGORÍA 4 — Prompt: BLOQUEO
+
+### 4.1 — CASO 22 (turno para dos personas) no disparaba BLOQUEO
+
+**Problema:** un mensaje casi idéntico al propio ejemplo del prompt ("necesito un turno para mí y para mi hijo/esposa, el mismo día") no disparaba `BLOQUEO: Agendamiento múltiple` — el agente empezaba a coordinar servicios para ambas personas dentro del mismo hilo, algo que la estructura de datos (una sola fila por paciente) no puede sostener sin corromper información.
+
+**Por qué surgió (causa identificada):** la tabla principal de BLOQUEO (sección 3, la que el modelo revisa primero, "Prioridad 0") **no tenía ninguna fila para esta categoría** — "Agendamiento múltiple" solo existía como CASO 22, en la sección 11, mucho más al fondo del prompt.
+
+**Solución exacta (refuerzo de prompt, 3 puntos aplicados):**
+- **Workflow principal `Agente Soni(8)`** → nodo `AI Agent` → `systemMessage`:
+  1. Nueva **fila en la tabla principal de BLOQUEO** (sección 3): "Turno para dos o más personas pedido junto, desde el primer mensaje... → `Agendamiento múltiple`".
+  2. Nuevo **ítem 33** del checklist de verificación.
+  3. Nueva **regla R36** (sección 10).
+  - *(Pendiente, no aplicado: un ejemplo INCORRECTO de refuerzo adicional en CASO 22 — se decidió no insistir por el tamaño del envío; ver Estado.)*
+
+**Estado:** ⚠️ **Aplicado parcialmente — NO resolvió el problema.** Se validó en vivo repitiendo el mismo mensaje exacto después del arreglo, y el modelo **volvió a no disparar BLOQUEO**. Esto indica que el problema no era solo la ausencia de la fila en la tabla — es el mismo patrón de inconsistencia que las categorías de BLOQUEO "blandas" (ver 4.2): el modelo no lo dispara de forma confiable ni siquiera con el refuerzo puesto directamente en la tabla principal. Por decisión conjunta, se dejó así por ahora sin seguir insistiendo con más cambios de prompt.
+
+---
+
+### 4.2 — BLOQUEO "blando" inconsistente (Fuera de alcance, Aviso de demora)
+
+**Problema:** mensajes claramente fuera de contexto ("¿venden repuestos de moto?") o de aviso de demora ("voy a llegar tarde a mi turno") no dispararon sus respectivos BLOQUEO — el agente los redirigió conversacionalmente en vez de escalar al equipo.
+
+**Por qué surgió:** a diferencia de las categorías "duras" (urgencia médica, cancelación, tono agresivo), que dispararon correctamente las tres veces que se probaron, estas categorías más "conversacionales" el modelo tiende a reinterpretarlas como algo resolvible charlando.
+
+**Solución exacta:** **pendiente de decisión** — no se aplicó ningún cambio todavía. A la fecha de este documento, no se definió si reforzar el prompt para que se cumplan siempre, o aceptar el comportamiento actual (no generó datos incorrectos, solo una escalación que no ocurrió).
+
+**Estado:** ⏸️ Sin resolver — pendiente de decisión de producto.
+
+---
+
+### 4.3 — Regla "no llamar herramienta de horario en el mismo ciclo que motivo" inconsistente
+
+**Problema:** cuando el paciente combina selección de servicio + período en un mismo mensaje (ej. "el 2 para esta semana"), el modelo a veces llama la herramienta de horario en el mismo ciclo que emite `motivo`, violando la regla explícita del prompt que exige esperar al ciclo siguiente.
+
+**Por qué surgió:** inconsistencia del modelo ante una regla ya documentada — se reprodujo dos veces en pruebas distintas, sin que generara datos falsos ni errores técnicos (el resultado mostrado fue correcto y completo).
+
+**Solución exacta:** **pendiente de decisión** — no se aplicó ningún cambio todavía.
+
+**Estado:** ⏸️ Sin resolver — pendiente de decisión de producto.
+
+---
+
+## CATEGORÍA 5 — Pulido menor de experiencia (sin aplicar, baja prioridad)
+
+- **Formato de lista de servicios:** a veces sale como texto corrido en una sola línea en vez del formato en columnas con saltos de línea que muestra el prompt.
+- **Sinónimos directos de servicio:** algunos sinónimos claros (ej. "sacarme una muela") a veces se tratan como ambiguos en vez de CASO DIRECTO.
+- **Silencio total al paciente mientras tiene BLOQUEO activo:** posiblemente intencional (freno de mano hasta que el equipo tome control), pero sin ningún acuse de recibo — a decidir si vale la pena un mensaje único de "ya te contactamos".
+
+**Estado:** ⏸️ Sin resolver — pulido de experiencia, sin apuro según lo acordado.
